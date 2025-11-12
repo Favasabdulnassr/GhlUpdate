@@ -91,6 +91,7 @@ DATABASES = {
 
 
 PRIVATE_ACCESS_TOKEN = config('PRIVATE_ACCESS_TOKEN')
+LOCATION_ID =  config('LOCATION_ID')
 
 # Password validation
 # https://docs.djangoproject.com/en/5.2/ref/settings/#auth-password-validators
