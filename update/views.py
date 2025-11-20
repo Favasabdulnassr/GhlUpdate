@@ -2,6 +2,11 @@ import requests
 from datetime import datetime
 from django.conf import settings
 from django.http import JsonResponse
+import pandas as pd
+from django.http import FileResponse
+import os
+
+
 
 
 
@@ -10,10 +15,18 @@ LOCATION_ID = settings.LOCATION_ID
 
 
 
+
+
 def get_match_opportunities(request):
     try:
-        result = find_matching_opportunity(LOCATION_ID, PRIVATE_ACCESS_TOKEN)
-        return JsonResponse({"status": "success", "data": result}, safe=False)
+        if "file" not in request.FILES:
+            return JsonResponse({"status": "error", "message": "No file uploaded"}, status=400)
+
+        file = request.FILES["file"]
+        result = find_matching_opportunity(LOCATION_ID, PRIVATE_ACCESS_TOKEN, file)
+
+        return JsonResponse({"status": "success", "data": result})
+
     except Exception as e:
         return JsonResponse({"status": "error", "message": str(e)}, status=500)
 
@@ -25,8 +38,70 @@ def to_date(iso_string):
     except Exception:
         return None
     
+import re
 
-def find_matching_opportunity(location_id, PRIVATE_ACCESS_TOKEN):
+def excel_date_to_date_only(date_str):
+    if not date_str:
+        return None
+
+    # Remove st, nd, rd, th
+    clean_str = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', date_str)
+
+    try:
+        # Format: "Sep 9 2025, 7:09 am"
+        dt = datetime.strptime(clean_str, "%b %d %Y, %I:%M %p")
+        return dt.date()
+    except Exception as e:
+        print("Excel date parse error:", e)
+        return None    
+    
+
+
+#  FETCH ALL PAGES OF OPPORTUNITIES
+def get_all_opportunities(base_url, headers, location_id):
+    all_opps = []
+    page = 1
+    limit = 100
+
+    while True:
+        url = f"{base_url}/opportunities/search?location_id={location_id}&page={page}&limit={limit}"
+        response = requests.get(url, headers=headers)
+
+        if response.status_code != 200:
+            break
+
+        data = response.json()
+        opps = data.get("opportunities", [])
+
+        if not opps:
+            break
+
+        all_opps.extend(opps)
+        page += 1
+
+    return all_opps
+
+
+
+
+
+
+
+
+def find_matching_opportunity(location_id, PRIVATE_ACCESS_TOKEN,uploaded_file):
+
+
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
+    except Exception as e:
+        return {"error": "Invalid file format", "details": str(e)}
+
+   
+    excel_rows = df.to_dict("records")
+
    
 
     base_url = "https://services.leadconnectorhq.com"
@@ -36,276 +111,162 @@ def find_matching_opportunity(location_id, PRIVATE_ACCESS_TOKEN):
         "Accept": "application/json"
     }
 
-    # Step 1: Get survey submissionrs
-    submissions_url = f"{base_url}/surveys/submissions?locationId={location_id}"
-    survey_response = requests.get(submissions_url, headers=headers)
 
-    if survey_response.status_code != 200:
-        print("Failed to fetch survey submissions:", survey_response.text)
-        return None
+    opportunities = get_all_opportunities(base_url, headers, location_id)
+    print("TOTAL OPPORTUNITIES FOUND:", len(opportunities))
 
-    survey_data = survey_response.json().get("submissions", [])
-    if not survey_data:
-        print("No survey submissions found.")
-        return None
+    updated_ids = []
+
+    print("Fetching custom fields...")
+    updated_count = 0
+
+
+
+      #  Fetch all opportunity custom fields
+
+    custom_fields_url = f"{base_url}/locations/{location_id}/customFields?model=opportunity"
+    cf_response = requests.get(custom_fields_url, headers=headers)
+
+    if cf_response.status_code != 200:
+        return {"error": "Failed to fetch custom fields", "details": cf_response.text}
+
+    custom_fields_data = cf_response.json().get("customFields", [])
+
+    # Create mapping: fieldKey --> fieldId
+    fieldkey_to_id = {
+        field.get("fieldKey"): field.get("id") 
+        for field in custom_fields_data
+    }
+
+    print("Total custom fields loaded:", len(fieldkey_to_id))
 
     # Step 2: Loop through each submission
-    for submission in survey_data:
-        contact_id = submission.get("contactId")
-        created_at = submission.get("createdAt")
-        others_data = submission.get("others", {})
-
-        if not contact_id or not created_at:
-            continue
-
-      
-        # Step 3: Search opportunities for this location
-        opportunity_url = f"{base_url}/opportunities/search?location_id={location_id}"
-        opp_response = requests.get(opportunity_url, headers=headers)
-
-        if opp_response.status_code != 200:
-            print("Failed to fetch opportunities:", opp_response.text)
-            continue
-
-        opportunities = opp_response.json().get("opportunities", [])
-
-        # Step 4: Match by contactId and creation date
-        for opp in opportunities:
-            submission_date = to_date(created_at)
-            opportunity_date = to_date(opp.get("createdAt", ""))
-            if opp.get("contactId") == contact_id and submission_date == opportunity_date:
-                           
-               # Step 5: Prepare custom field updates
-                opp_custom_fields = {field["id"]: field.get("fieldValueString") for field in opp.get("customFields", [])}
-                update_fields = []
-
-                for field_id, value in others_data.items():
-                    # Update if field exists or is new/missing value
-                    if field_id not in opp_custom_fields or not opp_custom_fields[field_id]:
-                        update_fields.append({
-                            "id": field_id,
-                            "value": value
-                        })
-
-                if not update_fields:
-                    print(f"ℹ No new custom fields to update for {contact_id}")
-                    continue
-
-                # Step 6: Send PATCH request to update opportunity
-                update_url = f"{base_url}/opportunities/{opp.get('id')}"
-                payload = {
-                    "customFields": update_fields
-                }
-
-                patch_resp = requests.patch(update_url, headers=headers, json=payload)
-                if patch_resp.status_code in (200, 201):
-                    print(f" Successfully updated opportunity {opp.get('id')} for contact {contact_id}")
-                else:
-                    print(f" Failed to update opportunity {opp.get('id')}: {patch_resp.text}")
-
-                return opp
-
-
-    print("No matching opportunities found.")
-    return None
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# import csv
-# import io
-# import requests
-# from django.http import JsonResponse
-# from django.views.decorators.csrf import csrf_exempt
-# from urllib.parse import urlparse, parse_qs
-
-# from django.conf import settings
-
-# customFields = [
-#     {"id": "zBw0eN9F6x2XnxeYW7Mj","name": "utm_campaign"},
-#     {"id": "O7fItuUg9euteSBk3eO0","name": "utm_keyword"},
-#     {"id": "DbOfSKtp8DaR36PRApNx","name": "utm_medium"},
-#     {"id": "X01bWrXKcX2DHEDI4voi","name": "utm_content"},
-#     {"id": "LwoUO80HQnEJFVhxUDVX","name": "latest_utm_medium"},
-#     {"id": "N0zSoUhW5GPRY1G0b3EA","name": "latest_utm_content"},
-#     {"id": "NtHtRPRD8Vui6P7QRqYs","name": "latest_utm_keyword"},
-#     {"id": "xeCOydWDwBy3D3m0LFCG", "name": "latest_utm_campaign"},
-
-
-# ]
-
-# custom_field_map = {field["name"].lower(): field["id"] for field in customFields}
-
-
-
-# def extract_utm_values(source):
-#     utm_data = {}
-
-#     if isinstance(source, str):
-#         parsed = urlparse(source)
-#         source = parse_qs(parsed.query)
-
-#     for key in ["utm_campaign", "utm_medium", "utm_content", "utm_keyword","latest_utm_campaign", "latest_utm_medium", "latest_utm_content", "latest_utm_keyword"]:
-#         values = source.get(key) or source.get(key.lower()) or []
-#         if not isinstance(values, list):
-#             values = [values]
-
-#         for v in values:
-#             if v and "{" not in v and "}" not in v:  
-#                 utm_data[key] = v
-#                 break
-
-#     return utm_data
-
-
-# @csrf_exempt
-# def update_contacts(request):
-#     if request.method != "POST":
-#         return JsonResponse({"error": "Only POST allowed"}, status=405)
-
-#     csv_file = request.FILES.get("file")
-#     if not csv_file:
-#         return JsonResponse({"error": "No CSV file uploaded"}, status=400)
-
-#     PRIVATE_ACCESS_TOKEN = settings.PRIVATE_ACCESS_TOKEN
-#     API_VERSION = "2021-07-28"
-#     BASE_URL = "https://services.leadconnectorhq.com"
-#     count = 0
-
-#     reader = csv.DictReader(io.StringIO(csv_file.read().decode("utf-8")))
-#     updated_contacts = []
-#     failed_contacts = []
-
-#     for row in reader:
-#         contact_id = row.get("Contact Id")
-#         if not contact_id:
-#             continue
-
-#         headers = {
-#             "Authorization": f"Bearer {PRIVATE_ACCESS_TOKEN}",
-#             "Version": API_VERSION,
-#             "Content-Type": "application/json"
-#         }
-
-#         contact_url = f"{BASE_URL}/contacts/{contact_id}"
-#         contact_resp = requests.get(contact_url, headers=headers)
-
-#         if contact_resp.status_code != 200:
-#             failed_contacts.append({
-#                 "contact_id": contact_id,
-#                 "error": f"Fetch failed ({contact_resp.status_code})"
-#             })
-#             continue
-
-#         contact_data = contact_resp.json().get("contact", {})
-
-#         first_source = contact_data.get("attributionSource", {}) or {}
-#         last_source = contact_data.get("lastAttributionSource", {}) or {}
-
-#         first_url = first_source.get("url", "")
-#         last_url = last_source.get("url", "")
-
-
-      
-
-#         first_utm = extract_utm_values(first_url)
-#         last_utm = extract_utm_values(last_url)
-
-#         if not first_utm and not last_utm:
-#             failed_contacts.append({
-#                 "contact_id": contact_id,
-#                 "error": "No non-placeholder UTM values found"
-#             })
-#             continue
-
-#         custom_fields = []
-#         customFields_failed = []
+    for submission in excel_rows:
 
         
 
 
-#         for key in ["utm_campaign", "utm_medium", "utm_content"]:
-#             value = last_utm.get(key) or first_utm.get(key)
-#             if value:
-#                 field_name = f"latest_{key.lower()}"
-#                 field_id = custom_field_map.get(field_name.lower())
-#                 if field_id:
-#                     custom_fields.append({
-#                         "id": field_id,
-#                         "key": field_name,
-#                         "field_value": value
-#                     })
-#                 else:
-#                     customFields_failed.append({
-#                         "key":field_name
-#                     })  
-                    
-                    
+
+        contact_id = submission.get("contact_id")
+        submission_date = submission.get("submission_date")
+
+        excel_date = excel_date_to_date_only(str(submission_date))
 
 
 
-#         if not custom_fields:
-#             failed_contacts.append({
-#                 "contact_id": contact_id,
-#                 "error": "No valid fields to update",
-#                 "failed_custom_fields": customFields_failed
-#             })
-#             continue
+
+        if not contact_id or not submission_date:
+            continue
 
 
-#         update_payload = {"customFields": custom_fields}
+        # Filter opportunities belonging to this contact_id
+        contact_opps = [
+            opp for opp in opportunities
+            if str(opp.get("contactId")).strip() == str(contact_id).strip()
+        ]
 
-#         update_resp = requests.put(contact_url, headers=headers, json=update_payload)
+        if not contact_opps:
+            print(f"No opportunities for contact {contact_id}")
+            continue
 
-#         if update_resp.status_code in (200, 201):
-#             updated_contacts.append({
-#                 "contact_id": contact_id,
-#                 "customField":custom_fields,
-#                 "failed_custom_fields":customFields_failed,
-
-#             })
-#         else:
-#             failed_contacts.append({
-#                 "contact_id": contact_id,
-#                 "error": f"Update failed ({update_resp.status_code})",
-#                 "details": update_resp.text
-#             })
-#         count += 1
-#         print(count,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',update_contacts,failed_contacts)    
+        matched_opp = None
 
 
-#     return JsonResponse({
-#         "message": "Processing completed",
-#         "updated": updated_contacts,
-#         "failed": failed_contacts,
-#     })
+        for opp in contact_opps:
+            opp_created_date = to_date(opp.get("createdAt", ""))
+
+            if not opp_created_date or not excel_date:
+                continue
+
+            if excel_date.year == opp_created_date.year and excel_date.month == opp_created_date.month:
+                matched_opp = opp
+                break  # STOP after first match
+
+            
+
+        if not matched_opp:
+            print(f"No matching opportunity for contact {contact_id} and date {submission_date}")
+            continue
+
+        opp_id = matched_opp.get("id")
+
+
+        update_fields = []
+
+        for column_name, column_value in submission.items():
+
+            # Only process columns that match opportunity custom fields
+            if not column_name.startswith("opportunity."):
+                continue
+
+            # match column to field key
+            field_id = fieldkey_to_id.get(column_name)
+
+            if not field_id:
+                print("No custom field for column:", column_name)
+                continue
+
+            # append update structure
+            update_fields.append({
+                "id": field_id,
+                "field_value": str(column_value)
+            })
+
+
+
+        if not update_fields:
+            continue
+
+
+
+         # Send update request
+        update_url = f"{base_url}/opportunities/{opp_id}"
+
+        payload = {
+            "customFields": update_fields
+        }
+
+        update_res = requests.put(update_url, json=payload, headers=headers)
+
+        if update_res.status_code in [200, 201]:
+            updated_count += 1
+            updated_ids.append({"contact_id": contact_id, "opportunity_id": opp_id}) 
+            print(f"Updated opportunity {opp_id}")
+
+           
+        else:
+            print(f"Failed to update {opp_id}", update_res.text)
+
+    return {
+        "status": "success",
+        "updated_opportunities": updated_count,
+        "updated_ids": updated_ids
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
