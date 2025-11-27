@@ -5,6 +5,7 @@ from django.http import JsonResponse
 import pandas as pd
 from django.http import FileResponse
 import os
+from .models import OpportunityTracker
 
 
 
@@ -17,13 +18,13 @@ LOCATION_ID = settings.LOCATION_ID
 
 
 
-def get_match_opportunities(request):
+def get_Create_match_opportunities(request):
     try:
         if "file" not in request.FILES:
             return JsonResponse({"status": "error", "message": "No file uploaded"}, status=400)
 
         file = request.FILES["file"]
-        result = find_matching_opportunity(LOCATION_ID, PRIVATE_ACCESS_TOKEN, file)
+        result = create_matching_opportunity_customField(LOCATION_ID, PRIVATE_ACCESS_TOKEN, file)
 
         return JsonResponse({"status": "success", "data": result})
 
@@ -84,11 +85,44 @@ def get_all_opportunities(base_url, headers, location_id):
 
 
 
+def get_pipelines(base_url, headers, location_id):
+
+    url = f"{base_url}/opportunities/pipelines"
+    params = {"locationId": location_id}
+    res = requests.get(url, headers=headers, params=params)
+
+    if res.status_code not in [200, 201]:
+        print("Failed to fetch pipelines:", res.text)
+        return []
+
+    data = res.json()
+    return data.get("pipelines", [])
+
+
+def create_new_opportunity(base_url, headers, location_id, contact_id, submission_date,pipeline_id, pipeline_stage_id):
+
+    payload = {
+        "locationId": location_id,
+        "contactId": contact_id,
+        "name": f"Imported Opportunity {contact_id} - {submission_date}",
+        "pipelineId": pipeline_id,           
+        "pipelineStageId": pipeline_stage_id , 
+        "status": "open"
+    }
+
+    url = f"{base_url}/opportunities/"
+    res = requests.post(url, json=payload, headers=headers)
+
+    if res.status_code not in [200, 201]:
+        print("Opportunity creation failed:", res.text)
+        return None
+
+    return res.json().get("id")
 
 
 
 
-def find_matching_opportunity(location_id, PRIVATE_ACCESS_TOKEN,uploaded_file):
+def create_matching_opportunity_customField(location_id, PRIVATE_ACCESS_TOKEN,uploaded_file):
 
 
     try:
@@ -159,36 +193,63 @@ def find_matching_opportunity(location_id, PRIVATE_ACCESS_TOKEN,uploaded_file):
             continue
 
 
-        # Filter opportunities belonging to this contact_id
-        contact_opps = [
-            opp for opp in opportunities
-            if str(opp.get("contactId")).strip() == str(contact_id).strip()
-        ]
 
-        if not contact_opps:
-            print(f"No opportunities for contact {contact_id}")
-            continue
+        ###  CHECK LOCAL DB FIRST
+        existing_entry = OpportunityTracker.objects.filter(
+            contact_id=contact_id,
+            submission_date=excel_date
+        ).first()
 
         matched_opp = None
 
+        if existing_entry:  
+            print(f"Found stored opportunity {existing_entry.opportunity_id} for {contact_id}")
+            matched_opp = next(
+                (o for o in opportunities if o.get("id") == existing_entry.opportunity_id), None
+            )
 
-        for opp in contact_opps:
-            opp_created_date = to_date(opp.get("createdAt", ""))
+        if not matched_opp:    
 
-            if not opp_created_date or not excel_date:
-                continue
+            # Filter opportunities belonging to this contact_id
+            contact_opps = [
+                opp for opp in opportunities
+                if str(opp.get("contactId")).strip() == str(contact_id).strip()
+            ]
 
-            if excel_date.year == opp_created_date.year and excel_date.month == opp_created_date.month:
-                matched_opp = opp
-                break  # STOP after first match
+
+            matched_opp = None
+
+
+            for opp in contact_opps:
+                opp_created_date = to_date(opp.get("createdAt", ""))
+
+                if not opp_created_date or not excel_date:
+                    continue
+
+                if excel_date.year == opp_created_date.year and excel_date.month == opp_created_date.month:
+                    matched_opp = opp
+                    break  # STOP after first match
 
             
 
         if not matched_opp:
-            print(f"No matching opportunity for contact {contact_id} and date {submission_date}")
-            continue
+            new_opp_id = create_new_opportunity(
+                base_url, headers, location_id,
+                contact_id, excel_date
+            )
 
-        opp_id = matched_opp.get("id")
+            if new_opp_id:
+                ###  SAVE TO DB
+                OpportunityTracker.objects.create(
+                    contact_id=contact_id,
+                    submission_date=excel_date,
+                    opportunity_id=new_opp_id
+                )
+
+            opp_id = new_opp_id
+
+        else:     
+            opp_id = matched_opp.get("id")
 
 
         update_fields = []
