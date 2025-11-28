@@ -5,7 +5,7 @@ from django.http import JsonResponse
 import pandas as pd
 from django.http import FileResponse
 import os
-from .models import OpportunityTracker
+from .models import OpportunityTracker,LocationDetail
 
 
 
@@ -99,14 +99,33 @@ def get_pipelines(base_url, headers, location_id):
     return data.get("pipelines", [])
 
 
-def create_new_opportunity(base_url, headers, location_id, contact_id, submission_date,pipeline_id, pipeline_stage_id):
+def get_contact_details(base_url, headers, contact_id):
+
+    url = f"{base_url}/contacts/{contact_id}"
+    res = requests.get(url, headers=headers)
+
+    if res.status_code not in [200, 201]:
+        print("Failed to fetch contact:", res.text)
+        return None
+
+    return res.json().get("contact")
+
+
+
+def create_new_opportunity(base_url, headers, location_id, contact_id,pipeline_id):
+
+
+     # Fetch contact info to get full name
+    contact_data = get_contact_details(base_url, headers, contact_id)
+
+    if contact_data:
+        full_name = f"{contact_data.get('firstName', '')} {contact_data.get('lastName', '')}".strip()
 
     payload = {
         "locationId": location_id,
         "contactId": contact_id,
-        "name": f"Imported Opportunity {contact_id} - {submission_date}",
+        "name": full_name,
         "pipelineId": pipeline_id,           
-        "pipelineStageId": pipeline_stage_id , 
         "status": "open"
     }
 
@@ -118,6 +137,8 @@ def create_new_opportunity(base_url, headers, location_id, contact_id, submissio
         return None
 
     return res.json().get("id")
+
+
 
 
 
@@ -144,6 +165,12 @@ def create_matching_opportunity_customField(location_id, PRIVATE_ACCESS_TOKEN,up
         "Version": "2021-07-28",
         "Accept": "application/json"
     }
+
+    location_obj = LocationDetail.objects.filter(ghl_location_id=location_id).first()
+    if not location_obj:
+        return {"error": f"Location {location_id} not found"}
+
+    pipeline_id = location_obj.pipeline_id
 
 
     opportunities = get_all_opportunities(base_url, headers, location_id)
@@ -235,7 +262,7 @@ def create_matching_opportunity_customField(location_id, PRIVATE_ACCESS_TOKEN,up
         if not matched_opp:
             new_opp_id = create_new_opportunity(
                 base_url, headers, location_id,
-                contact_id, excel_date
+                contact_id,pipeline_id
             )
 
             if new_opp_id:
